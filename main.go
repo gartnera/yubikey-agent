@@ -49,6 +49,7 @@ func main() {
 	}
 
 	socketPath := flag.String("l", "", "agent: path of the UNIX socket to listen on")
+	preferredSerial := flag.Int("preferred-serial", 0, "agent: preferred serial number to use. will fall back to next card if not found.")
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
 	flag.Parse()
@@ -70,18 +71,20 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		runAgent(*socketPath)
+		runAgent(*socketPath, *preferredSerial)
 	}
 }
 
-func runAgent(socketPath string) {
+func runAgent(socketPath string, preferredSerial int) {
 	if terminal.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
 		log.Println("Consider using the launchd or systemd services.")
 	}
 
-	a := &Agent{}
+	a := &Agent{
+		preferredSerial: uint32(preferredSerial),
+	}
 
 	c := make(chan os.Signal)
 	signal.Notify(c, syscall.SIGHUP)
@@ -118,9 +121,10 @@ func runAgent(socketPath string) {
 }
 
 type Agent struct {
-	mu     sync.Mutex
-	yk     *piv.YubiKey
-	serial uint32
+	mu              sync.Mutex
+	yk              *piv.YubiKey
+	serial          uint32
+	preferredSerial uint32
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -139,7 +143,7 @@ func (a *Agent) serveConn(c net.Conn) {
 func healthy(yk *piv.YubiKey) bool {
 	// We can't use Serial because it locks the session on older firmwares, and
 	// can't use Retries because it fails when the session is unlocked.
-	_, err := yk.AttestationCertificate()
+	_, err := yk.Certificate(piv.SlotAuthentication)
 	return err == nil
 }
 
@@ -174,7 +178,7 @@ func (a *Agent) maybeReleaseYK() {
 }
 
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
-	yk, err := openYK()
+	yk, err := openYK(a.preferredSerial)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +188,7 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 	return yk, nil
 }
 
-func openYK() (yk *piv.YubiKey, err error) {
+func openYK(preferredSerial uint32) (*piv.YubiKey, error) {
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
@@ -192,15 +196,24 @@ func openYK() (yk *piv.YubiKey, err error) {
 	if len(cards) == 0 {
 		return nil, errors.New("no YubiKey detected")
 	}
+	var bestYk *piv.YubiKey
 	// TODO: support multiple YubiKeys. For now, select the first one that opens
 	// successfully, to skip any internal unused smart card readers.
 	for _, card := range cards {
-		yk, err = piv.Open(card)
-		if err == nil {
-			return
+		yk, err := piv.Open(card)
+		if err != nil {
+			continue
 		}
+		serial, err := yk.Serial()
+		if err != nil {
+			continue
+		}
+		if serial == preferredSerial {
+			return yk, nil
+		}
+		bestYk = yk
 	}
-	return
+	return bestYk, err
 }
 
 func (a *Agent) Close() error {

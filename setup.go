@@ -43,7 +43,7 @@ func init() {
 }
 
 func connectForSetup() *piv.YubiKey {
-	yk, err := openYK()
+	yk, err := openYK(0)
 	if err != nil {
 		log.Fatalln("Failed to connect to the YubiKey:", err)
 	}
